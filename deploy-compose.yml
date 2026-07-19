@@ -19,7 +19,7 @@ services:
 
   deep-research-mcp:
     # Образ из GitHub Container Registry — замени username при необходимости
-    image: ${IMAGE:-ghcr.io/ermolaevtv/deep-research-mcp}:${VERSION:-latest}
+    image: ${IMAGE:-ghcr.io/tvermolaev-source/deep-research-mcp}:${VERSION:-latest}
     container_name: deep-research-mcp
     depends_on:
       - searxng

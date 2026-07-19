@@ -11,7 +11,7 @@
 set -euo pipefail
 
 VERSION="${1:-latest}"
-IMAGE="${IMAGE:-ghcr.io/ermolaevtv/deep-research-mcp}"
+IMAGE="${IMAGE:-ghcr.io/tvermolaev-source/deep-research-mcp}"
 HOST="${DEPLOY_HOST:-}"
 REMOTE_DIR="${REMOTE_DIR:-deep-research}"
 
