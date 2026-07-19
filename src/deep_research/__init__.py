@@ -5,4 +5,4 @@ https://github.com/ItzCrazyKns/Vane (researcher/index.ts), но
 переписаны на Python и доступны как инструменты MCP-протокола.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
