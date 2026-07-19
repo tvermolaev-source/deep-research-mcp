@@ -249,6 +249,14 @@ def _format_result(out: ResearchOutput) -> str:
 # Entrypoint
 # ─────────────────────────────────────────────────────────────────────
 def main() -> None:
+    """Запуск MCP-сервера.
+
+    Используется uvicorn напрямую (а не server.run()) — это позволяет
+    отключить валидацию Host-заголовка, без которой Open WebUI получает
+    421 Misdirected Request при обращении по имени контейнера/IP.
+    """
+    import uvicorn
+
     cfg = get_config()
     server = build_server()
     logger.info(
@@ -258,10 +266,75 @@ def main() -> None:
         cfg.searxng.url,
         cfg.llm.base_url,
     )
-    # streamable-http — современный транспорт MCP, читается Open WebUI
-    server.settings.host = cfg.server.host
-    server.settings.port = cfg.server.port
-    server.run(transport="streamable-http")
+
+    # Берём ASGI-приложение FastMCP, чтобы запустить его через uvicorn
+    # с нужными флагами (host_header_validation=False).
+    # В разных версиях mcp/FastMCP атрибут называется по-разному:
+    #   - app        — ASGI-приложение (новые версии)
+    #   - streamable_http_app() — фабрика (mcp >= 1.2)
+    app = None
+    for getter in (
+        lambda: getattr(server, "app", None),
+        lambda: getattr(server, "streamable_http_app", None),
+        lambda: getattr(server, "sse_app", None),
+    ):
+        cand = getter()
+        if cand is None:
+            continue
+        app = cand() if callable(cand) else cand
+        if app is not None:
+            break
+
+    if app is None:
+        # Fallback — старый путь (выставит настройки и запустит встроенным)
+        server.settings.host = cfg.server.host
+        server.settings.port = cfg.server.port
+        server.run(transport="streamable-http")
+        return
+
+    # ASGI-middleware: гасит 404 на /openapi.json и /docs — некоторые клиенты
+    # (например, Open WebUI) сначала пробуют загрузить OpenAPI-схему. MCP-сервер
+    # её не отдаёт, но отвечать 404 на эти два пути неприятно — лучше вернуть
+    # минимальный валидный JSON, чтобы клиент не сыпал ошибками в UI.
+    from starlette.responses import JSONResponse
+    from starlette.routing import Match
+    from starlette.types import Scope
+
+    class _QuietOpenAPIMiddleware:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def __call__(self, scope: Scope, receive, send):
+            if scope["type"] == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "GET")
+                if method == "GET" and path in ("/openapi.json", "/docs", "/docs/oauth2-redirect"):
+                    resp = JSONResponse(
+                        {"openapi": "3.1.0", "info": {"title": "deep-research-mcp", "version": "1.0"}, "paths": {}}
+                    )
+                    await resp(scope, receive, send)
+                    return
+                # Проверяем, не идёт ли запрос на /openapi.json с другим префиксом
+                # (OWUI иногда опрашивает /mcp/openapi.json)
+                if method == "GET" and path.endswith("/openapi.json"):
+                    resp = JSONResponse(
+                        {"openapi": "3.1.0", "info": {"title": "deep-research-mcp", "version": "1.0"}, "paths": {}}
+                    )
+                    await resp(scope, receive, send)
+                    return
+            await self.inner(scope, receive, send)
+
+    wrapped_app = _QuietOpenAPIMiddleware(app)
+
+    uvicorn.run(
+        wrapped_app,
+        host=cfg.server.host,
+        port=cfg.server.port,
+        # КРИТИЧНО для Open WebUI: без этого 421 Misdirected Request
+        # при Host: deep-research:8765 или другом внешнем имени.
+        host_header_validation=False,
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
+    )
 
 
 if __name__ == "__main__":
