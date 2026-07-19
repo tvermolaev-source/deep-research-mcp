@@ -22,12 +22,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -35,11 +29,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub (optional)
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract version
         id: meta
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      - name: Build & push
+      - name: Build & push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/deep-research-mcp:latest
+            ghcr.io/${{ github.repository_owner }}/deep-research-mcp:${{ steps.meta.outputs.VERSION }}
+          labels: |
+            org.opencontainers.image.title=deep-research-mcp
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.VERSION }}
+
+      - name: Build & push to Docker Hub (if secrets configured)
+        if: env.DOCKERHUB_OK == 'true'
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -48,12 +65,6 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/deep-research-mcp:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/deep-research-mcp:${{ steps.meta.outputs.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/deep-research-mcp:latest
-            ghcr.io/${{ github.repository_owner }}/deep-research-mcp:${{ steps.meta.outputs.VERSION }}
-          labels: |
-            org.opencontainers.image.title=deep-research-mcp
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.VERSION }}
 
   github-release:
     name: GitHub Release
