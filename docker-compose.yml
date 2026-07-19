@@ -1,50 +1,38 @@
-version: "3.9"
+# Standalone MCP-сервер.
+# SearXNG уже запущен в твоём проекте — здесь только deep-research-mcp.
+#
+# Использование:
+#   docker compose pull
+#   docker compose up -d
 
 services:
-  searxng:
-    image: searxng/searxng:latest
-    container_name: searxng
-    ports:
-      - "8888:8080"
-    volumes:
-      - searxng-data:/etc/searxng
-    restart: unless-stopped
-    # Внутреннее имя сервиса — "searxng" — именно его ждёт MCP-сервер
-    networks:
-      - dr-net
-
   deep-research-mcp:
-    build: .
+    image: ${IMAGE:-ghcr.io/tvermolaev-source/deep-research-mcp}:${VERSION:-latest}
     container_name: deep-research-mcp
-    depends_on:
-      - searxng
     environment:
-      SEARXNG_URL: "http://searxng:8080"
-      SEARXNG_LANGUAGE: "ru"
-      SEARXNG_ENGINES: "google,bing,duckduckgo"
-      SEARXNG_SAFESEARCH: "0"
+      # URL твоего существующего SearXNG (на хосте или в другой сети)
+      SEARXNG_URL: "${SEARXNG_URL:-http://host.docker.internal:8888}"
+      SEARXNG_LANGUAGE: "${SEARXNG_LANGUAGE:-ru}"
+      SEARXNG_ENGINES: "${SEARXNG_ENGINES:-google,bing,duckduckgo}"
+      SEARXNG_SAFESEARCH: "${SEARXNG_SAFESEARCH:-0}"
 
-      # OpenAI-совместимый endpoint. По умолчанию — Open WebUI (если он в той же сети)
+      # LLM endpoint (Ollama / Open WebUI proxy / OpenAI-compatible)
       LLM_BASE_URL: "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
       LLM_API_KEY: "${LLM_API_KEY:-ollama}"
       LLM_MODEL: "${LLM_MODEL:-qwen2.5:7b}"
 
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8765"
-      MAX_ITERATIONS_BALANCED: "6"
-      MAX_PARALLEL_CRAWLS: "5"
-      LOG_LEVEL: "INFO"
+      MAX_ITERATIONS_BALANCED: "${MAX_ITERATIONS_BALANCED:-6}"
+      MAX_PARALLEL_CRAWLS: "${MAX_PARALLEL_CRAWLS:-5}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     ports:
-      - "8765:8765"
+      - "${MCP_PORT:-8765}:8765"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    networks:
-      - dr-net
     restart: unless-stopped
-
-networks:
-  dr-net:
-    driver: bridge
-
-volumes:
-  searxng-data:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/mcp', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

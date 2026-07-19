@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Деплой на свой сервер.
-# Использование:
-#   DEPLOY_HOST=user@server ./scripts/deploy.sh v0.1.0
+# Деплой deep-research-mcp на сервер.
+# SearXNG/Open WebUI предполагаются уже поднятыми — здесь только MCP.
 #
-# Требует:
-#   • SSH-доступ к серверу
-#   • Docker + docker compose plugin на сервере
-#   • SearXNG-контейнер уже запущен на сервере (или будет поднят этим скриптом)
+# Использование:
+#   DEPLOY_HOST=user@server ./scripts/deploy.sh v0.1.2
 
 set -euo pipefail
 
@@ -24,13 +21,14 @@ echo "🚀 Deploying $IMAGE:$VERSION to $HOST:$REMOTE_DIR"
 
 ssh "$HOST" "mkdir -p $REMOTE_DIR"
 
-# Копируем актуальный compose
+# Копируем минимальный набор
 scp docker-compose.yml "$HOST:$REMOTE_DIR/docker-compose.yml"
 scp .env.example "$HOST:$REMOTE_DIR/.env.example"
 
 ssh "$HOST" "cd $REMOTE_DIR && \
   if [[ ! -f .env ]]; then cp .env.example .env; fi && \
-  docker compose pull deep-research-mcp 2>/dev/null || true; \
+  IMAGE=$IMAGE VERSION=$VERSION docker compose pull deep-research-mcp && \
   IMAGE=$IMAGE VERSION=$VERSION docker compose up -d deep-research-mcp"
 
-echo "✅ Done. Check: ssh $HOST 'docker logs -f \${REMOTE_DIR}-deep-research-mcp-1'"
+echo "✅ Done. Logs: ssh $HOST 'docker logs -f deep-research-mcp'"
+echo "✅ Health: ssh $HOST 'docker inspect --format=\"{{.State.Health.Status}}\" deep-research-mcp'"
