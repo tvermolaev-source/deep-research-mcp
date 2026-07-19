@@ -1,0 +1,60 @@
+# Production compose — для деплоя на сервер.
+# Тянет уже собранный образ из GHCR, без локальной сборки.
+#
+# Использование:
+#   docker compose -f deploy-compose.yml pull
+#   docker compose -f deploy-compose.yml up -d
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+    restart: unless-stopped
+    networks:
+      - dr-net
+
+  deep-research-mcp:
+    # Образ из GitHub Container Registry — замени username при необходимости
+    image: ${IMAGE:-ghcr.io/ermolaevtv/deep-research-mcp}:${VERSION:-latest}
+    container_name: deep-research-mcp
+    depends_on:
+      - searxng
+    environment:
+      SEARXNG_URL: "http://searxng:8080"
+      SEARXNG_LANGUAGE: "${SEARXNG_LANGUAGE:-ru}"
+      SEARXNG_ENGINES: "${SEARXNG_ENGINES:-google,bing,duckduckgo}"
+      SEARXNG_SAFESEARCH: "${SEARXNG_SAFESEARCH:-0}"
+
+      # LLM endpoint — подставь свой (Ollama/Open WebUI proxy/...)
+      LLM_BASE_URL: "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
+      LLM_API_KEY: "${LLM_API_KEY:-ollama}"
+      LLM_MODEL: "${LLM_MODEL:-qwen2.5:7b}"
+
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8765"
+      MAX_ITERATIONS_BALANCED: "${MAX_ITERATIONS_BALANCED:-6}"
+      MAX_PARALLEL_CRAWLS: "${MAX_PARALLEL_CRAWLS:-5}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    ports:
+      - "${MCP_PORT:-8765}:8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - dr-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/mcp', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  dr-net:
+    driver: bridge
+
+volumes:
+  searxng-data:

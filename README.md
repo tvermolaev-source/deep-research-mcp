@@ -167,6 +167,14 @@ Deep_Research/
 | `lib/scraper` | `tools/crawl_client.py` (Crawl4AI) |
 | `lib/session.emitBlock` | `streaming.EventBus` |
 
-## 📜 Лицензия
+## � CI/CD и деплой
+
+См. **[DEPLOY.md](DEPLOY.md)** — полная инструкция:
+- GitHub Actions: тесты + автосборка Docker-образа
+- Multi-arch образ (amd64 + arm64) в GHCR
+- `./scripts/release.sh patch` → push тега → авторелиз
+- `./scripts/deploy.sh v0.1.0 user@server` → деплой одной командой
+
+## �📜 Лицензия
 
 MIT
