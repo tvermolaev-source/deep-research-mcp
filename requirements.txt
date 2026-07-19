@@ -1,7 +1,11 @@
 # MCP server dependencies
 mcp[cli]>=1.0.0
 starlette>=0.40.0
-uvicorn[standard]>=0.30.0
+# uvicorn>=0.32 нужен, чтобы был параметр host_header_validation.
+# В нашем server.py мы НЕ зависим от этого параметра (отключаем Host-валидацию
+# через ASGI-middleware, который работает на любой версии), но держим
+# минимальную версию >=0.32, чтобы при обновлениях ничего не сломалось.
+uvicorn[standard]>=0.32.0
 sse-starlette>=2.1.0
 pydantic>=2.5.0
 

@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Позволяет перезапустить сборку вручную с вкладки Actions —
+  # полезно, если авто-сборка по тегу упала (например, из-за таймаута
+  # или прав на push в GHCR).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия для тегирования (например 0.1.5). Если пусто — используется текущий тег или latest."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -38,7 +47,20 @@ jobs:
 
       - name: Extract version
         id: meta
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: |
+          # При пуше тега — берём версию из тега.
+          # При ручном запуске (workflow_dispatch) — из inputs.version,
+          # иначе — latest.
+          if [ "${{ github.event_name }}" = "push" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="latest"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved version: $VERSION"
 
       - name: Build & push to GHCR
         uses: docker/build-push-action@v6

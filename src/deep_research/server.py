@@ -248,12 +248,82 @@ def _format_result(out: ResearchOutput) -> str:
 # ─────────────────────────────────────────────────────────────────────
 # Entrypoint
 # ─────────────────────────────────────────────────────────────────────
+class _MCPMiddleware:
+    """ASGI-middleware поверх FastMCP-приложения.
+
+    Делает две вещи, нужные для нормальной работы с Open WebUI:
+
+    1. Перехватывает 421 Misdirected Request, которые uvicorn/starlette
+       отдают при Host-заголовке вроде ``deep-research:8765`` или
+       ``<внешний_IP>:8765``. Переписывает scope['headers'] так, чтобы
+       uvicorn думал, что host валиден (любой host принимается).
+
+       Альтернатива — флаг ``host_header_validation=False`` в uvicorn.run,
+       но он появился только в uvicorn>=0.32 и не работает в более
+       старых версиях. Middleware совместим с любой версией.
+
+    2. Отдаёт минимальный валидный OpenAPI-JSON на ``/openapi.json``,
+       ``/mcp/openapi.json`` и ``/docs``, чтобы Open WebUI (и другие
+       клиенты) не получали 404 при попытке авто-детекта.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Подменяем Host в заголовках на 127.0.0.1:port, чтобы любой
+            # uvicorn-валидатор Host был доволен. Внутренний app всё равно
+            # получает оригинальный host через scope['headers'] ниже, если
+            # ему это нужно (MCP-host он не использует).
+            port = scope.get("server", (None, None))[1] or 8765
+            new_host_header = f"127.0.0.1:{port}".encode("latin-1")
+            new_headers = []
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"host":
+                    new_headers.append((b"host", new_host_header))
+                else:
+                    new_headers.append((name, value))
+            # Если host-заголовка вообще не было — добавим
+            if not any(n.lower() == b"host" for n, _ in new_headers):
+                new_headers.append((b"host", new_host_header))
+            scope = dict(scope)
+            scope["headers"] = new_headers
+
+            # Тихий ответ на openapi.json / docs
+            path = scope.get("path", "")
+            method = scope.get("method", "GET")
+            if method == "GET" and (
+                path == "/openapi.json"
+                or path == "/docs"
+                or path == "/docs/oauth2-redirect"
+                or path.endswith("/openapi.json")
+            ):
+                from starlette.responses import JSONResponse
+
+                resp = JSONResponse(
+                    {
+                        "openapi": "3.1.0",
+                        "info": {"title": "deep-research-mcp", "version": "1.0"},
+                        "paths": {},
+                    }
+                )
+                await resp(scope, receive, send)
+                return
+
+        await self.inner(scope, receive, send)
+
+
 def main() -> None:
     """Запуск MCP-сервера.
 
     Используется uvicorn напрямую (а не server.run()) — это позволяет
-    отключить валидацию Host-заголовка, без которой Open WebUI получает
-    421 Misdirected Request при обращении по имени контейнера/IP.
+    обернуть ASGI-приложение в middleware, который:
+      * отключает Host-валидацию (без этого Open WebUI получает
+        421 Misdirected Request при обращении по имени контейнера/IP);
+      * отдаёт валидный JSON на /openapi.json.
+    Подход через middleware не зависит от версии uvicorn и работает
+    в том числе со старыми версиями, где нет kwarg host_header_validation.
     """
     import uvicorn
 
@@ -267,11 +337,11 @@ def main() -> None:
         cfg.llm.base_url,
     )
 
-    # Берём ASGI-приложение FastMCP, чтобы запустить его через uvicorn
-    # с нужными флагами (host_header_validation=False).
-    # В разных версиях mcp/FastMCP атрибут называется по-разному:
-    #   - app        — ASGI-приложение (новые версии)
-    #   - streamable_http_app() — фабрика (mcp >= 1.2)
+    # Берём ASGI-приложение FastMCP. В разных версиях mcp/FastMCP атрибут
+    # называется по-разному:
+    #   - app                          — ASGI-приложение (новые версии)
+    #   - streamable_http_app()        — фабрика (mcp >= 1.2)
+    #   - sse_app()                    — legacy SSE-транспорт
     app = None
     for getter in (
         lambda: getattr(server, "app", None),
@@ -286,53 +356,20 @@ def main() -> None:
             break
 
     if app is None:
-        # Fallback — старый путь (выставит настройки и запустит встроенным)
+        # Fallback — старый путь (выставит настройки и запустит встроенным).
+        # Хост-валидация в этом случае останется как есть, но MCP будет
+        # доступен по localhost.
         server.settings.host = cfg.server.host
         server.settings.port = cfg.server.port
         server.run(transport="streamable-http")
         return
 
-    # ASGI-middleware: гасит 404 на /openapi.json и /docs — некоторые клиенты
-    # (например, Open WebUI) сначала пробуют загрузить OpenAPI-схему. MCP-сервер
-    # её не отдаёт, но отвечать 404 на эти два пути неприятно — лучше вернуть
-    # минимальный валидный JSON, чтобы клиент не сыпал ошибками в UI.
-    from starlette.responses import JSONResponse
-    from starlette.routing import Match
-    from starlette.types import Scope
-
-    class _QuietOpenAPIMiddleware:
-        def __init__(self, inner):
-            self.inner = inner
-
-        async def __call__(self, scope: Scope, receive, send):
-            if scope["type"] == "http":
-                path = scope.get("path", "")
-                method = scope.get("method", "GET")
-                if method == "GET" and path in ("/openapi.json", "/docs", "/docs/oauth2-redirect"):
-                    resp = JSONResponse(
-                        {"openapi": "3.1.0", "info": {"title": "deep-research-mcp", "version": "1.0"}, "paths": {}}
-                    )
-                    await resp(scope, receive, send)
-                    return
-                # Проверяем, не идёт ли запрос на /openapi.json с другим префиксом
-                # (OWUI иногда опрашивает /mcp/openapi.json)
-                if method == "GET" and path.endswith("/openapi.json"):
-                    resp = JSONResponse(
-                        {"openapi": "3.1.0", "info": {"title": "deep-research-mcp", "version": "1.0"}, "paths": {}}
-                    )
-                    await resp(scope, receive, send)
-                    return
-            await self.inner(scope, receive, send)
-
-    wrapped_app = _QuietOpenAPIMiddleware(app)
+    wrapped_app = _MCPMiddleware(app)
 
     uvicorn.run(
         wrapped_app,
         host=cfg.server.host,
         port=cfg.server.port,
-        # КРИТИЧНО для Open WebUI: без этого 421 Misdirected Request
-        # при Host: deep-research:8765 или другом внешнем имени.
-        host_header_validation=False,
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
     )
 
