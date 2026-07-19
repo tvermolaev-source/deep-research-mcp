@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+    restart: unless-stopped
+    # Внутреннее имя сервиса — "searxng" — именно его ждёт MCP-сервер
+    networks:
+      - dr-net
+
+  deep-research-mcp:
+    build: .
+    container_name: deep-research-mcp
+    depends_on:
+      - searxng
+    environment:
+      SEARXNG_URL: "http://searxng:8080"
+      SEARXNG_LANGUAGE: "ru"
+      SEARXNG_ENGINES: "google,bing,duckduckgo"
+      SEARXNG_SAFESEARCH: "0"
+
+      # OpenAI-совместимый endpoint. По умолчанию — Open WebUI (если он в той же сети)
+      LLM_BASE_URL: "${LLM_BASE_URL:-http://host.docker.internal:11434/v1}"
+      LLM_API_KEY: "${LLM_API_KEY:-ollama}"
+      LLM_MODEL: "${LLM_MODEL:-qwen2.5:7b}"
+
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8765"
+      MAX_ITERATIONS_BALANCED: "6"
+      MAX_PARALLEL_CRAWLS: "5"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8765:8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - dr-net
+    restart: unless-stopped
+
+networks:
+  dr-net:
+    driver: bridge
+
+volumes:
+  searxng-data:
