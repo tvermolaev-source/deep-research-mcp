@@ -68,6 +68,67 @@ class LimitsConfig:
     max_results_per_query: int = field(default_factory=lambda: _get_int("MAX_RESULTS_PER_QUERY", 10))
     crawl_timeout_sec: int = field(default_factory=lambda: _get_int("CRAWL_TIMEOUT_SEC", 60))
 
+    # ── Фильтрация выдачи SearXNG ──────────────────────────────────
+    # Дефолты подобраны так, чтобы работало **эффективно даже без .env**:
+    #  • MIN_RESULT_SCORE=0.5 — отбрасывает откровенный шум (PDF-фолдеры,
+    #    посты соцсетей со score ~0.1) и не режет легитимные результаты
+    #    Google/Brave (типичный score 1.5–5).
+    #  • RESULTS_TOP_K_PER_QUERY=5 — баланс качества и скорости: после
+    #    реранкинга 5 лучших URL на запрос, остальное игнорируется.
+    #  • DOMAIN_BOOST_THRESHOLD=2 — если один домен вылез по ≥2 разным
+    #    запросам в рамках одной итерации — он узнаваемый «эксперт».
+    #  • BLOCKED_DOMAINS — уже включает facebook/vk/instagram и др.,
+    #    .env может дополнить или урезать.
+    #  • PRIORITY_DOMAINS — оставлен пустым (пользователь решает сам,
+    #    чьё «экспертное» доменное имя ему важно).
+    min_result_score: float = field(
+        default_factory=lambda: float(os.getenv("MIN_RESULT_SCORE", "0.5"))
+    )
+    results_top_k_per_query: int = field(
+        default_factory=lambda: _get_int("RESULTS_TOP_K_PER_QUERY", 5)
+    )
+    domain_boost_threshold: int = field(
+        default_factory=lambda: _get_int("DOMAIN_BOOST_THRESHOLD", 2)
+    )
+    blocked_domains: list[str] = field(
+        default_factory=lambda: _get_list(
+            "BLOCKED_DOMAINS",
+            [
+                "facebook.com",
+                "fb.com",
+                "instagram.com",
+                "tiktok.com",
+                "pinterest.com",
+                "vk.com",
+                "ok.ru",
+                "linkedin.com",
+                "twitter.com",
+                "x.com",
+                "reddit.com",
+            ],
+        )
+    )
+    priority_domains: list[str] = field(
+        default_factory=lambda: _get_list(
+            "PRIORITY_DOMAINS",
+            [
+                # Большие русскоязычные СМИ/научные порталы — по дефолту,
+                # чтобы тематические новости/научпоп выходили выше.
+                "ria.ru",
+                "tass.ru",
+                "rbc.ru",
+                "vedomosti.ru",
+                "kommersant.ru",
+                "interfax.ru",
+                "hightech.fm",
+                "naukaip.ru",
+                "hse.ru",
+                "sk.ru",
+                "ras.ru",
+            ],
+        )
+    )
+
 
 @dataclass
 class Config:

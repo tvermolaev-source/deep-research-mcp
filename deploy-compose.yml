@@ -25,6 +25,13 @@ services:
       MAX_ITERATIONS_BALANCED: "${MAX_ITERATIONS_BALANCED:-6}"
       MAX_PARALLEL_CRAWLS: "${MAX_PARALLEL_CRAWLS:-5}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+      # ── Фильтрация выдачи SearXNG (эффективные дефолты) ────────────────
+      MIN_RESULT_SCORE: "${MIN_RESULT_SCORE:-0.5}"
+      RESULTS_TOP_K_PER_QUERY: "${RESULTS_TOP_K_PER_QUERY:-5}"
+      DOMAIN_BOOST_THRESHOLD: "${DOMAIN_BOOST_THRESHOLD:-2}"
+      BLOCKED_DOMAINS: "${BLOCKED_DOMAINS:-facebook.com,fb.com,instagram.com,tiktok.com,pinterest.com,vk.com,ok.ru,linkedin.com,twitter.com,x.com,reddit.com}"
+      PRIORITY_DOMAINS: "${PRIORITY_DOMAINS:-ria.ru,tass.ru,rbc.ru,vedomosti.ru,kommersant.ru,interfax.ru,hightech.fm,naukaip.ru,hse.ru,sk.ru,ras.ru}"
     ports:
       - "${MCP_PORT:-8765}:8765"
     extra_hosts:

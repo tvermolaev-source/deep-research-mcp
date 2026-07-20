@@ -208,22 +208,95 @@ class Researcher:
             per_query = self.config.limits.max_results_per_query
             results_by_q = await searxng.search_many(queries, max_results_per_query=per_query)
 
-            # Объединяем, дедуплицируем по URL
-            all_results: list[SearXNGResult] = []
+            # ── Нормализация + фильтрация выдачи SearXNG ───────────────
+            # 1) выбрасываем мусор по домену (соцсети, PDF-фолдеры и т.п.)
+            # 2) отсекаем результаты ниже MIN_RESULT_SCORE
+            # 3) считаем по доменам, сколько раз они всплыли по разным
+            #    запросам; если >= DOMAIN_BOOST_THRESHOLD — даём доменный буст.
+            # 4) сортируем и режем верх RESULTS_TOP_K_PER_QUERY на запрос.
+            limits = self.config.limits
+            blocked = [d.lower() for d in limits.blocked_domains]
+            priority = [d.lower() for d in limits.priority_domains]
+
+            def _domain(url: str) -> str:
+                try:
+                    from urllib.parse import urlparse
+                    host = urlparse(url).hostname or ""
+                    # выкидываем www. для группировки
+                    if host.startswith("www."):
+                        host = host[4:]
+                    return host.lower()
+                except Exception:
+                    return ""
+
+            # Считаем частоту доменов по всем запросам, чтобы дать буст
+            domain_hits: dict[str, int] = {}
             for q in queries:
+                seen_q: set[str] = set()
                 for r in results_by_q.get(q, []):
-                    if r.url and r.url not in self._seen_urls:
-                        self._seen_urls.add(r.url)
-                        all_results.append(r)
+                    d = _domain(r.url)
+                    if not d or d in seen_q:
+                        continue
+                    seen_q.add(d)
+                    domain_hits[d] = domain_hits.get(d, 0) + 1
+
+            def _rank(r: SearXNGResult) -> float:
+                score = float(r.score or 0.0)
+                d = _domain(r.url)
+                # Бонус если домен приоритетный
+                if any(d.endswith(p) for p in priority):
+                    score += 50.0
+                # Бонус если домен часто появляется по разным запросам
+                hits = domain_hits.get(d, 0)
+                if hits >= limits.domain_boost_threshold:
+                    score += 10.0 * hits
+                # Небольшой бонус за совпадение контента с оригинальным запросом
+                return score
+
+            merged: list[SearXNGResult] = []
+            kept_per_query: dict[str, list[SearXNGResult]] = {}
+            for q in queries:
+                raw = results_by_q.get(q, [])
+                # 1) выбрасываем уже виденные URL — это наша глобальная защита
+                # 2) выбрасываем по доменам-блэклисту
+                # 3) выбрасываем по min_result_score
+                filtered: list[SearXNGResult] = []
+                for r in raw:
+                    if not r.url or r.url in self._seen_urls:
+                        continue
+                    d = _domain(r.url)
+                    if any(d.endswith(b) for b in blocked):
+                        continue
+                    if float(r.score or 0.0) < limits.min_result_score:
+                        continue
+                    filtered.append(r)
+                # сортируем по rank и оставляем top-K
+                filtered.sort(key=_rank, reverse=True)
+                top = filtered[: limits.results_top_k_per_query]
+                kept_per_query[q] = top
+                for r in top:
+                    self._seen_urls.add(r.url)
+                    merged.append(r)
+
+            dropped_by_query = {
+                q: len(results_by_q.get(q, [])) - len(kept_per_query.get(q, []))
+                for q in queries
+            }
 
             await self.bus.emit_search_results(
-                [{"title": r.title, "url": r.url, "content": r.content} for r in all_results]
+                [{"title": r.title, "url": r.url, "content": r.content} for r in merged]
             )
+
+            # Возвращаем LLM: что вернули после фильтрации + метаданные
+            # (сколько отбросили) — чтобы модель знала, что выборка сокращена
+            # и при необходимости могла переформулировать запрос.
             return {
                 "type": "search_results",
+                "filtered_out": dropped_by_query,
+                "min_result_score": limits.min_result_score,
                 "results": [
                     {"title": r.title, "url": r.url, "content": r.content}
-                    for r in all_results
+                    for r in merged
                 ],
             }
 
