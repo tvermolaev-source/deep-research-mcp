@@ -177,9 +177,9 @@ http://<адрес_контейнера>:8765/mcp
 | `DOMAIN_BOOST_THRESHOLD` | `2` | Буст домена, если он встретился по ≥N запросам |
 | `BLOCKED_DOMAINS` | *(пусто)* | Список доменов под безусловный отсев (opt-in) |
 | `PRIORITY_DOMAINS` | *(пусто)* | Список доменов-экспертов, +100 к рангу (opt-in) |
-| `SOCIAL_DOMAINS` | *(пусто)* | Домены соцсетей — поднимаются в режиме «ищи в социальных сетях» |
-| `ACADEMIC_DOMAINS` | *(пусто)* | Домены научных/академических источников — для режима «факт-чек» |
-| `NEWS_DOMAINS` | *(пусто)* | Домены СМИ — для режима «новости/статьи» |
+| `SOCIAL_DOMAINS` | 12 источников | Домены соцсетей — поднимаются в режиме «ищи в социальных сетях» |
+| `ACADEMIC_DOMAINS` | 29 источников | Домены научных/академических источников — для режима «факт-чек» |
+| `NEWS_DOMAINS` | 36 источников | Домены мировых СМИ — для режима «новости/статьи» |
 | `INTENT_DETECTION` | `true` | Включён ли детектор намерений в запросе пользователя |
 
 ### 🧭 Адаптивные режимы поиска
@@ -214,32 +214,31 @@ Researcher автоматически распознаёт намерение п
 6. **Адаптивный режим** — если пользователь сказал «ищи в X», соответствующие
    домены получают +100 к рангу (остальные не трогаются).
 
-Чтобы режим «ищи в соцсетях» реально работал, задайте хотя бы:
+Адаптивные списки **`SOCIAL_DOMAINS` / `ACADEMIC_DOMAINS` / `NEWS_DOMAINS`
+уже предзаполнены** авторитетными источниками мирового уровня (12 / 29 / 36
+доменов соответственно) — см. `src/deep_research/config.py`.
 
-```env
-SOCIAL_DOMAINS=vk.com,facebook.com,twitter.com,x.com,instagram.com,reddit.com,tiktok.com,linkedin.com
-ACADEMIC_DOMAINS=.edu,arxiv.org,scholar.google.com,pubmed.ncbi.nlm.nih.gov,nature.com,science.org,researchgate.net,jstor.org
-NEWS_DOMAINS=ria.ru,tass.ru,rbc.ru,vedomosti.ru,kommersant.ru,interfax.ru,lenta.ru,reuters.com
-```
+Их критерии: скорость поступления информации, качество журналистики /
+peer-review, охват и доверие аудитории. Например:
 
-Если оставить списки пустыми — адаптивный режим будет работать вхолостую
-(модель не найдёт, что поднимать в топ, и просто получит нейтральную выдачу).
-Это сознательное решение: никаких «правильных» списков по дефолту,
-только ваш выбор через ENV.
+* `SOCIAL_DOMAINS` — Twitter/X, Reddit, Facebook, Instagram, LinkedIn,
+  TikTok, Threads, Mastodon, YouTube, VK, Telegram.
+* `ACADEMIC_DOMAINS` — `.edu` (все университеты мира), `arxiv.org`,
+  `biorxiv.org`, `scholar.google.com`, `nature.com`, `science.org`,
+  `cell.com`, `thelancet.com`, `nejm.org`, `sciencedirect.com`,
+  Springer, Wiley, JSTOR, PLOS, Frontiers, MDPI, IEEE, ACM, …
+* `NEWS_DOMAINS` — Reuters, AP, AFP, BBC, Guardian, NYT, WaPo, WSJ,
+  FT, Bloomberg, CNN, Al Jazeera, DW, France 24, Le Monde, El País,
+  Spiegel, Asahi, SCMP, Straits Times + научпоп-порталы (Nature,
+  Scientific American, New Scientist, TechCrunch, The Verge, Wired)
+  + ведущие русскоязычные СМИ (РИА, ТАСС, РБК, Ведомости, Коммерсантъ,
+  Интерфакс, Лента, Газета).
 
-## 🧪 Тесты
+Чтобы **заменить** дефолтный набор — просто задайте переменную в `.env`,
+она переопределит встроенный список (но **не** сольётся с ним).
 
-```bash
-pip install pytest pytest-asyncio
-pytest -v
-```
-
-Покрытие:
-- `test_streaming.py` — EventBus
-- `test_searxng_client.py` — клиент SearXNG (мок httpx)
-- `test_tools.py` — fallback HTML-парсер
-- `test_researcher.py` — полный цикл Researcher (моки LLM/SearXNG/Crawl)
-- `test_filtering.py` — фильтрация и реранкинг (blocked, min-score, top-K, boost, dedup)
+Все домены указаны как **суффиксы** (.com/....org) или TLD-префиксы (.edu),
+поэтому внутренние поддомены (`m.twitter.com`, `cs.mit.edu`, …) тоже матчатся.
 
 ## 📁 Структура проекта
 

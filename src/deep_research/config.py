@@ -69,22 +69,12 @@ class LimitsConfig:
     crawl_timeout_sec: int = field(default_factory=lambda: _get_int("CRAWL_TIMEOUT_SEC", 60))
 
     # ── Реранкинг выдачи SearXNG ────────────────────────────────────
-    # Базовая фильтрация/реранкинг на основе score и доменной частоты.
-    # Никаких жёстких блокировок по доменам по умолчанию — пользователь
-    # сам решает, какие источники важны, через ENV или через явное
-    # указание в запросе («ищи в социальных сетях», «научное подтверждение»).
-    #
     # • MIN_RESULT_SCORE=0.0       — отключено по умолчанию; выдача
     #   не режется по score, если явно не задать порог.
     # • RESULTS_TOP_K_PER_QUERY=10 — после реранкинга оставляем 10 URL
     #   на запрос (вместе с MAX_RESULTS_PER_QUERY определяет выборку).
     # • DOMAIN_BOOST_THRESHOLD=2   — если один домен встретился по ≥2
     #   разным запросам в одной итерации — он узнаваемый «эксперт».
-    #
-    # Домены ниже — опциональные ENV-настройки. По умолчанию всё пусто:
-    # мы не хотим навязывать пользователю «правильный» список источников.
-    # Если нужно поднять в топ любимый сайт — задайте PRIORITY_DOMAINS;
-    # если нужно что-то отсечь — задайте BLOCKED_DOMAINS. Всё сугубо opt-in.
     min_result_score: float = field(
         default_factory=lambda: float(os.getenv("MIN_RESULT_SCORE", "0.0"))
     )
@@ -94,12 +84,13 @@ class LimitsConfig:
     domain_boost_threshold: int = field(
         default_factory=lambda: _get_int("DOMAIN_BOOST_THRESHOLD", 2)
     )
-    # Категория «всегда блокировать» — пусто по умолчанию. Чтобы включить,
-    # задайте BLOCKED_DOMAINS=facebook.com,vk.com в .env.
+    # Категория «всегда блокировать» — пусто по умолчанию.
+    # Чтобы включить, задайте BLOCKED_DOMAINS=facebook.com,vk.com в .env.
     blocked_domains: list[str] = field(
         default_factory=lambda: _get_list("BLOCKED_DOMAINS", [])
     )
-    # «Поднять в топ» для нейтрального режима — тоже пусто по умолчанию.
+    # «Поднять в топ» для нейтрального режима — пусто по умолчанию.
+    # Заполните через PRIORITY_DOMAINS=… в .env, если нужно.
     priority_domains: list[str] = field(
         default_factory=lambda: _get_list("PRIORITY_DOMAINS", [])
     )
@@ -107,16 +98,116 @@ class LimitsConfig:
     # ── Мягкие приоритеты для адаптивных режимов ───────────────────
     # Эти словари используются только когда пользователь явно попросил
     # конкретный тип источника в запросе («ищи в соцсетях», «научный
-    # факт-чек»). Они НЕ применяются к дефолтному нейтральному поиску.
-    # Никаких блокировок: только поднять нужный домен в топ через реранкинг.
+    # факт-чек», «новости в СМИ»). Никаких блокировок — только поднять
+    # нужный домен в топ через реранкинг (+100 к рангу).
+    #
+    # Ниже — предзаполненные наборы авторитетных источников мирового уровня,
+    # подобранные по критериям: скорость поступления информации, качество
+    # журналистики/рецензирования, охват и доверие аудитории. Чтобы полностью
+    # заменить — задайте соответствующую ENV-переменную.
     social_domains: list[str] = field(
-        default_factory=lambda: _get_list("SOCIAL_DOMAINS", [])
+        default_factory=lambda: _get_list(
+            "SOCIAL_DOMAINS",
+            [
+                # Мировые соцсети/платформы обсуждений
+                "twitter.com",
+                "x.com",
+                "reddit.com",
+                "facebook.com",
+                "instagram.com",
+                "linkedin.com",
+                "tiktok.com",
+                "threads.net",
+                "mastodon.social",
+                "t.me",
+                "vk.com",
+                "youtube.com",
+            ],
+        )
     )
     academic_domains: list[str] = field(
-        default_factory=lambda: _get_list("ACADEMIC_DOMAINS", [])
+        default_factory=lambda: _get_list(
+            "ACADEMIC_DOMAINS",
+            [
+                # Препринты и репозитории
+                ".edu",
+                "arxiv.org",
+                "biorxiv.org",
+                "medrxiv.org",
+                "psyarxiv.com",
+                "scholar.google.com",
+                "researchgate.net",
+                "academia.edu",
+                "doi.org",
+                # Топ-журналы (peer-review)
+                "nature.com",
+                "science.org",
+                "cell.com",
+                "thelancet.com",
+                "nejm.org",
+                "sciencedirect.com",
+                "springer.com",
+                "link.springer.com",
+                "wiley.com",
+                "onlinelibrary.wiley.com",
+                "jstor.org",
+                "plos.org",
+                "plosone.org",
+                "frontiersin.org",
+                "mdpi.com",
+                "cambridge.org",
+                "oxford.academic.com",
+                "royalsocietypublishing.org",
+                "ieee.org",
+                "acm.org",
+            ],
+        )
     )
     news_domains: list[str] = field(
-        default_factory=lambda: _get_list("NEWS_DOMAINS", [])
+        default_factory=lambda: _get_list(
+            "NEWS_DOMAINS",
+            [
+                # Мировые информагентства и топ-СМИ
+                "reuters.com",
+                "apnews.com",
+                "afp.com",
+                "bbc.com",
+                "theguardian.com",
+                "nytimes.com",
+                "washingtonpost.com",
+                "wsj.com",
+                "ft.com",
+                "bloomberg.com",
+                "cnn.com",
+                "aljazeera.com",
+                "dw.com",
+                "france24.com",
+                "lemonde.fr",
+                "elpais.com",
+                "spiegel.de",
+                "asahi.com",
+                "scmp.com",
+                "straitstimes.com",
+                # Технологические и научпоп-порталы
+                "nature.com",
+                "scientificamerican.com",
+                "newscientist.com",
+                "techcrunch.com",
+                "theverge.com",
+                "arstechnica.com",
+                "wired.com",
+                "hightech.fm",
+                # Русскоязычные СМИ
+                "ria.ru",
+                "tass.ru",
+                "rbc.ru",
+                "vedomosti.ru",
+                "kommersant.ru",
+                "interfax.ru",
+                "lenta.ru",
+                "gazeta.ru",
+            ],
+        )
     )
 
     # ── Детектор намерений ──────────────────────────────────────────
