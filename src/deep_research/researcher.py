@@ -22,6 +22,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config, get_config, max_iterations_for
+from .filter_policy import (
+    FilterPolicy,
+    host_from_url,
+    make_policy,
+    matches_domain,
+    rank_score,
+    should_drop,
+)
+from .intent import Intent, IntentMatch, detect_intent
 from .llm_client import LLMClient, LLMResponse, ToolCall
 from .prompts import (
     EXTRACTOR_PROMPT,
@@ -61,11 +70,29 @@ class Researcher:
         self,
         config: Config | None = None,
         event_bus: EventBus | None = None,
+        query: str | None = None,
     ) -> None:
         self.config = config or get_config()
         self.bus = event_bus or EventBus()
         self._seen_urls: set[str] = set()
         self._all_sources: list[dict[str, str]] = []
+        # Распознаём намерение ОДИН раз при инициализации — по тексту
+        # запроса пользователя. Если детектор отключён или ничего не
+        # нашёл — это None (нейтральный режим).
+        self._intent_match: IntentMatch | None = self._detect(query)
+        self._intent_emitted = False
+
+    def _detect(self, query: str | None) -> IntentMatch | None:
+        if not query:
+            return None
+        limits = self.config.limits
+        if not getattr(limits, "intent_detection_enabled", True):
+            return None
+        return detect_intent(query)
+
+    @property
+    def intent(self) -> IntentMatch | None:
+        return self._intent_match
 
     # ─────────────────────────────────────────────────────────────────
     # Главный метод
@@ -205,74 +232,89 @@ class Researcher:
             # В Vane до 3 запросов за вызов
             queries = queries[:3]
             await self.bus.emit_search_start(queries)
-            per_query = self.config.limits.max_results_per_query
+
+            limits = self.config.limits
+            per_query = limits.max_results_per_query
             results_by_q = await searxng.search_many(queries, max_results_per_query=per_query)
 
-            # ── Нормализация + фильтрация выдачи SearXNG ───────────────
-            # 1) выбрасываем мусор по домену (соцсети, PDF-фолдеры и т.п.)
-            # 2) отсекаем результаты ниже MIN_RESULT_SCORE
-            # 3) считаем по доменам, сколько раз они всплыли по разным
-            #    запросам; если >= DOMAIN_BOOST_THRESHOLD — даём доменный буст.
-            # 4) сортируем и режем верх RESULTS_TOP_K_PER_QUERY на запрос.
-            limits = self.config.limits
-            blocked = [d.lower() for d in limits.blocked_domains]
-            priority = [d.lower() for d in limits.priority_domains]
+            # ── Адаптивная политика реранкинга ────────────────────────
+            # На основании распознанного намерения (по тексту запроса)
+            # собираем политику, которая:
+            #  • социальным/научным/новостным режимам — поднимает свои
+            #    домены в топ (но не блокирует остальные);
+            #  • ``all`` — снимает все ограничения и бусты;
+            #  • нейтральному режиму — только ENV-приоритеты и стоп-лист,
+            #    если они заданы (по дефолту всё пусто).
+            intent_name: Intent = (
+                self._intent_match.intent if self._intent_match else "neutral"
+            )
+            policy = make_policy(
+                intent_name,
+                social=limits.social_domains,
+                academic=limits.academic_domains,
+                news=limits.news_domains,
+                neutral_priority=limits.priority_domains,
+                blocked=limits.blocked_domains,
+                min_score=limits.min_result_score,
+                domain_boost_threshold=limits.domain_boost_threshold,
+                top_k=limits.results_top_k_per_query,
+            )
 
-            def _domain(url: str) -> str:
-                try:
-                    from urllib.parse import urlparse
-                    host = urlparse(url).hostname or ""
-                    # выкидываем www. для группировки
-                    if host.startswith("www."):
-                        host = host[4:]
-                    return host.lower()
-                except Exception:
-                    return ""
+            if not self._intent_emitted:
+                # Сообщим UI, какой режим реранкинга активен.
+                payload: dict[str, Any] = {
+                    "intent": intent_name,
+                    "matched": (
+                        self._intent_match.matched_keyword
+                        if self._intent_match
+                        else None
+                    ),
+                    "title": policy.title,
+                    "priority": policy.priority[:5],
+                }
+                if self._intent_match:
+                    payload["reason"] = (
+                        f"распознано ключевое слово «{self._intent_match.matched_keyword}»"
+                    )
+                else:
+                    payload["reason"] = "нейтральный режим (без активной подсказки)"
+                self._intent_emitted = True
+                logger.info("search policy: %s", policy.title)
 
             # Считаем частоту доменов по всем запросам, чтобы дать буст
             domain_hits: dict[str, int] = {}
             for q in queries:
                 seen_q: set[str] = set()
                 for r in results_by_q.get(q, []):
-                    d = _domain(r.url)
-                    if not d or d in seen_q:
+                    h = host_from_url(r.url)
+                    if not h or h in seen_q:
                         continue
-                    seen_q.add(d)
-                    domain_hits[d] = domain_hits.get(d, 0) + 1
-
-            def _rank(r: SearXNGResult) -> float:
-                score = float(r.score or 0.0)
-                d = _domain(r.url)
-                # Бонус если домен приоритетный
-                if any(d.endswith(p) for p in priority):
-                    score += 50.0
-                # Бонус если домен часто появляется по разным запросам
-                hits = domain_hits.get(d, 0)
-                if hits >= limits.domain_boost_threshold:
-                    score += 10.0 * hits
-                # Небольшой бонус за совпадение контента с оригинальным запросом
-                return score
+                    seen_q.add(h)
+                    domain_hits[h] = domain_hits.get(h, 0) + 1
 
             merged: list[SearXNGResult] = []
             kept_per_query: dict[str, list[SearXNGResult]] = {}
             for q in queries:
                 raw = results_by_q.get(q, [])
-                # 1) выбрасываем уже виденные URL — это наша глобальная защита
-                # 2) выбрасываем по доменам-блэклисту
-                # 3) выбрасываем по min_result_score
-                filtered: list[SearXNGResult] = []
+                # Применяем политику: фильтрация + реранкинг.
+                kept: list[SearXNGResult] = []
                 for r in raw:
-                    if not r.url or r.url in self._seen_urls:
+                    drop, _reason = should_drop(
+                        r.url,
+                        float(r.score or 0.0),
+                        policy,
+                        self._seen_urls,
+                    )
+                    if drop:
                         continue
-                    d = _domain(r.url)
-                    if any(d.endswith(b) for b in blocked):
-                        continue
-                    if float(r.score or 0.0) < limits.min_result_score:
-                        continue
-                    filtered.append(r)
-                # сортируем по rank и оставляем top-K
-                filtered.sort(key=_rank, reverse=True)
-                top = filtered[: limits.results_top_k_per_query]
+                    kept.append(r)
+
+                # Сортируем по rank с учётом бустов политики.
+                kept.sort(
+                    key=lambda r: rank_score(r.url, r.score or 0.0, policy, domain_hits),
+                    reverse=True,
+                )
+                top = kept[: policy.top_k]
                 kept_per_query[q] = top
                 for r in top:
                     self._seen_urls.add(r.url)
@@ -288,12 +330,17 @@ class Researcher:
             )
 
             # Возвращаем LLM: что вернули после фильтрации + метаданные
-            # (сколько отбросили) — чтобы модель знала, что выборка сокращена
-            # и при необходимости могла переформулировать запрос.
+            # (сколько отбросили + активная политика) — чтобы модель знала,
+            # что выборка сокращена и могла переформулировать запрос.
             return {
                 "type": "search_results",
                 "filtered_out": dropped_by_query,
-                "min_result_score": limits.min_result_score,
+                "policy": {
+                    "intent": intent_name,
+                    "title": policy.title,
+                    "priority_count": len(policy.priority),
+                    "blocked_count": len(policy.blocked),
+                },
                 "results": [
                     {"title": r.title, "url": r.url, "content": r.content}
                     for r in merged

@@ -201,7 +201,10 @@ async def _run_research(
         mode=mode,  # type: ignore[arg-type]
         chat_history=chat_history,
     )
-    researcher = Researcher(event_bus=bus)
+    # Передаём query, чтобы Researcher мог распознать намерение
+    # («ищи в соцсетях», «научный факт-чек» и т.п.) один раз
+    # при инициализации.
+    researcher = Researcher(event_bus=bus, query=query)
     try:
         out = await researcher.research(inp)
     except Exception as exc:  # noqa: BLE001
