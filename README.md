@@ -252,6 +252,8 @@ Deep_Research/
 ├── src/deep_research/
 │   ├── server.py              # FastMCP-сервер (entrypoint)
 │   ├── researcher.py          # главный цикл итеративного поиска
+│   ├── intent.py              # детектор намерений по тексту запроса (RU+EN)
+│   ├── filter_policy.py       # политики фильтрации/реранкинга по intent
 │   ├── llm_client.py          # OpenAI-compatible клиент + streaming + tool calls
 │   ├── prompts.py             # промпты (портированы с Vane)
 │   ├── streaming.py           # EventBus — стрим событий в UI
@@ -264,8 +266,33 @@ Deep_Research/
     ├── test_streaming.py
     ├── test_searxng_client.py
     ├── test_tools.py
-    └── test_researcher.py
+    ├── test_researcher.py
+    └── test_filtering.py      # intent-детектор + политики + реранкинг (52 теста)
 ```
+
+## 🆕 Что нового в v0.3.0
+
+- **Адаптивная фильтрация по доменам** — Researcher распознаёт намерение пользователя
+  по тексту запроса (`social` / `academic` / `news` / `all` / `neutral`) и мягко
+  поднимает нужный тип источников в топ. Никаких автоблоков — другие источники не
+  отсекаются, только получают меньший ранг. Детектор использует RU+EN ключевые слова,
+  расширяемые через `INTENT_KEYWORDS_*`.
+- **Предзаполненные наборы доменов мирового уровня** —
+  `SOCIAL_DOMAINS` (12), `ACADEMIC_DOMAINS` (29), `NEWS_DOMAINS` (36). Подобраны
+  по скорости поступления информации, качеству журналистики/peer-review, охвату и
+  доверию аудитории. Переопределяются через `.env` целиком (без слияния с дефолтом).
+- **Никаких жёстких блокировок по доменам** — убрали авто-блоклист соцсетей.
+  Хотите отсечь конкретный домен — задайте `BLOCKED_DOMAINS=…` (opt-in).
+- **Новые модули**:
+  * `src/deep_research/intent.py` — детектор намерений по тексту запроса.
+  * `src/deep_research/filter_policy.py` — политики реранкинга под каждый intent
+    (`make_policy`, `matches_domain`, `rank_score`, `should_drop`).
+- **Расширенные тесты** — `tests/test_filtering.py` покрывает детектор, политики,
+  матчинг доменов (включая `.edu`-TLD) и интеграцию с Researcher. **52 теста,
+  все зелёные.**
+- **API для MCP/UI** — результат `web_search` теперь содержит поле `policy`
+  (`intent`, `priority_count`, `blocked_count`), чтобы клиентский UI мог
+  показать, в каком режиме выполнен поиск.
 
 ## 🧬 Портировано с Vane
 
