@@ -6,7 +6,7 @@ starlette>=0.40.0
 # через ASGI-middleware, который работает на любой версии), но держим
 # минимальную версию >=0.32, чтобы при обновлениях ничего не сломалось.
 uvicorn[standard]>=0.32.0
-sse-starlette>=2.1.0
+sse-starlette>=3.4.5
 pydantic>=2.5.0
 
 # HTTP client
