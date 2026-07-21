@@ -1,7 +1,9 @@
 """Тесты Researcher — с моками SearXNG/Crawl/LLM."""
+from __future__ import annotations
+
 import asyncio
 import json
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -16,6 +18,7 @@ from deep_research.types import ResearchInput
 class _FakeSearXNG:
     def __init__(self, results_per_query):
         self._r = results_per_query
+        self.last_categories: list | None = None
 
     async def __aenter__(self):
         return self
@@ -23,7 +26,16 @@ class _FakeSearXNG:
     async def __aexit__(self, *exc):
         return None
 
-    async def search_many(self, queries, *, max_results_per_query=None):
+    async def search_many(
+        self,
+        queries,
+        *,
+        max_results_per_query=None,
+        categories=None,
+    ):
+        # Сохраняем последние категории — чтобы тесты могли проверить,
+        # что LLM-план корректно прокидывается в SearXNGClient.
+        self.last_categories = categories
         out = {}
         for q in queries:
             out[q] = list(self._r.get(q, []))
@@ -45,11 +57,23 @@ class _FakeCrawler:
 
 
 class _FakeLLM:
-    """Эмулирует поведение LLM: выдаёт заранее заготовленные tool calls."""
+    """Эмулирует поведение LLM: выдаёт заранее заготовленные tool calls.
 
-    def __init__(self, scripts: list[list[ToolCall]]):
+    Поддерживает сценарии с planner/worker роутингом:
+      • если в начале истории есть system='source-planner' — отдаёт
+        фиктивный JSON с SourcePlan;
+      • если stream=True — стримит синтез-чанки;
+      • иначе — отдаёт следующий script по tool_calls.
+    """
+
+    def __init__(self, scripts: list[list[ToolCall]], source_plan_json: str | None = None):
         self._scripts = scripts
         self._idx = 0
+        self._source_plan_json = source_plan_json or (
+            '{"intent":"general","searxng_categories":["general"],'
+            '"rationale":"test","needs_social":false,"needs_academic":false,'
+            '"needs_news":false,"needs_videos":false}'
+        )
 
     async def __aenter__(self):
         return self
@@ -58,6 +82,12 @@ class _FakeLLM:
         return None
 
     async def chat(self, messages, *, tools=None, stream=False, **kw):
+        # Source-plan вызов: system содержит "research-strategy classifier"
+        if messages and isinstance(messages, list):
+            sys_msg = messages[0].get("content", "") if messages[0].get("role") == "system" else ""
+            if "research-strategy classifier" in sys_msg:
+                return LLMResponse(content=self._source_plan_json, tool_calls=[])
+
         # Фаза синтеза: последний вызов со stream=True отдает стрим ответа
         if stream:
             async def _gen():
@@ -74,6 +104,31 @@ class _FakeLLM:
 
     async def generate_text(self, prompt, *, system=None):
         return "synth answer"
+
+
+class _FakeLLMFactory:
+    """Подмена LLMFactory: возвращает _FakeLLM и как planner, и как worker.
+
+    Один и тот же _FakeLLM используется в обеих ролях — для тестов
+    этого достаточно, потому что worker вызывается только в _extract_facts
+    при длинном контенте, а в нашем тесте content короткий.
+    """
+
+    def __init__(self, scripts: list[list[ToolCall]], source_plan_json: str | None = None):
+        self._fake = _FakeLLM(scripts, source_plan_json=source_plan_json)
+
+    async def __aenter__(self):
+        await self._fake.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self._fake.__aexit__(*exc)
+
+    def planner(self):
+        return self._fake
+
+    def worker(self):
+        return self._fake
 
 
 def _plan_tc(plan="Plan"): return ToolCall(id="p1", name="__reasoning_preamble", arguments={"plan": plan})
@@ -111,11 +166,18 @@ async def test_researcher_runs_full_cycle(monkeypatch):
     # URL в search results не должен матчиться с URL в scrape (разные домены) —
     # иначе тест ловит дедуп по _seen_urls.
     monkeypatch.setattr(rmod, "CrawlClient", lambda *_a, **_kw: _FakeCrawler(crawler_results))
-    monkeypatch.setattr(rmod, "LLMClient", lambda *_a, **_kw: _FakeLLM([
+    # Подменяем LLMFactory на фейк: один _FakeLLM используется и как
+    # planner, и как worker (worker нужен только для _extract_facts при
+    # длинном контенте, в нашем тесте content короткий — см. ниже).
+    scripts = [
         [_plan_tc("Ищу отчёт"), _search_tc(["renewable energy 2025"])],
         [_plan_tc("Читаю источник"), _scrape_tc(["https://example.com/report"])],
         [_plan_tc("Готово"), _done_tc()],
-    ]))
+    ]
+    monkeypatch.setattr(
+        rmod, "LLMFactory",
+        lambda *_a, **_kw: _FakeLLMFactory(scripts),
+    )
 
     bus = EventBus()
     received = []

@@ -58,19 +58,26 @@ class SearXNGClient:
         query: str,
         *,
         max_results: int | None = None,
+        categories: list[str] | None = None,
     ) -> list[SearXNGResult]:
         """Один поисковый запрос.
 
         Возвращает список SearXNGResult, отсортированный по позиции в выдаче.
+
+        Если передан ``categories`` — используется он (например,
+        ``["science"]`` для научных статей, ``["social"]`` для соцсетей,
+        ``["videos"]`` для YouTube). Иначе — ``self.config.categories``
+        (дефолт из конфига).
         """
         assert self._client is not None, "SearXNGClient must be used as async context manager"
 
+        cats = categories if categories is not None else self.config.categories
         params: dict[str, Any] = {
             "q": query,
             "format": "json",
             "language": self.config.language,
             "safesearch": self.config.safesearch,
-            "categories": ",".join(self.config.categories),
+            "categories": ",".join(cats) if cats else "",
         }
         if self.config.engines:
             params["engines"] = ",".join(self.config.engines)
@@ -114,9 +121,18 @@ class SearXNGClient:
         queries: list[str],
         *,
         max_results_per_query: int | None = None,
+        categories: list[str] | None = None,
     ) -> dict[str, list[SearXNGResult]]:
-        """Запускает несколько запросов параллельно."""
-        tasks = [self.search(q, max_results=max_results_per_query) for q in queries]
+        """Запускает несколько запросов параллельно.
+
+        Если передан ``categories`` — все запросы идут в этих категориях
+        (например, ``["science"]`` для факт-чека, ``["videos"]`` для
+        YouTube). Иначе — дефолтные из конфига.
+        """
+        tasks = [
+            self.search(q, max_results=max_results_per_query, categories=categories)
+            for q in queries
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: dict[str, list[SearXNGResult]] = {}
         for q, r in zip(queries, results):

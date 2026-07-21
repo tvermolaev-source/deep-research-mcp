@@ -40,9 +40,44 @@ class SearXNGConfig:
 
 @dataclass
 class LLMConfig:
+    """Конфигурация LLM-эндпоинтов.
+
+    Поддерживает роутинг моделей по ролям:
+      • ``model``         — основная модель (используется, если роли
+                            не заданы — обратная совместимость).
+      • ``planner_model`` — сильная модель для планирования, выбора
+                            источников и финального синтеза. Если не
+                            задана — fallback на ``model``.
+      • ``worker_model``  — лёгкая/дешёвая модель для рутинных задач
+                            (извлечение фактов из чанков). Если не
+                            задана — fallback на ``model``.
+
+    Опционально worker может ходить на отдельный endpoint
+    (``worker_base_url`` / ``worker_api_key``) — удобно, когда worker
+    крутится локально (Ollama 3B), а planner — в облаке.
+    """
     base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"))
     api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "ollama"))
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen2.5:7b"))
+
+    # Роутинг по ролям (опционально). Если пусто — везде используется model.
+    planner_model: str = field(default_factory=lambda: os.getenv("LLM_PLANNER_MODEL", ""))
+    worker_model: str = field(default_factory=lambda: os.getenv("LLM_WORKER_MODEL", ""))
+    # Опционально — другой endpoint для worker'а (например, локальный Ollama).
+    worker_base_url: str = field(default_factory=lambda: os.getenv("LLM_WORKER_BASE_URL", ""))
+    worker_api_key: str = field(default_factory=lambda: os.getenv("LLM_WORKER_API_KEY", ""))
+
+    def resolved_planner_model(self) -> str:
+        return self.planner_model or self.model
+
+    def resolved_worker_model(self) -> str:
+        return self.worker_model or self.model
+
+    def worker_endpoint(self) -> tuple[str, str]:
+        """Возвращает (base_url, api_key) для worker-эндпоинта."""
+        base = self.worker_base_url or self.base_url
+        key = self.worker_api_key or self.api_key
+        return base, key
 
 
 @dataclass

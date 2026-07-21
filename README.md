@@ -161,11 +161,16 @@ http://<адрес_контейнера>:8765/mcp
 |---|---|---|
 | `SEARXNG_URL` | `http://searxng:8080` | URL SearXNG |
 | `SEARXNG_LANGUAGE` | `ru` | Язык поиска (можно `en`, `en-all`) |
+| `SEARXNG_CATEGORIES` | `general` | Дефолтные SearXNG-категории (используются, если LLM-планировщик не сработал). Допустимые: `general news science social videos images files music it map` |
 | `SEARXNG_ENGINES` | `google,bing,duckduckgo` | Список движков |
 | `SEARXNG_SAFESEARCH` | `0` | 0/1/2 |
 | `LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-совместимый endpoint |
 | `LLM_API_KEY` | `ollama` | API-ключ |
-| `LLM_MODEL` | `qwen2.5:7b` | Модель для планирования/суммаризации |
+| `LLM_MODEL` | `qwen2.5:7b` | Базовая модель (используется обеими ролями, если роли не заданы) |
+| `LLM_PLANNER_MODEL` | *(пусто → `LLM_MODEL`)* | **Сильная** модель для планирования источников и финального синтеза |
+| `LLM_WORKER_MODEL` | *(пусто → `LLM_MODEL`)* | **Слабая/дешёвая** модель для извлечения фактов из чанков |
+| `LLM_WORKER_BASE_URL` | *(пусто → `LLM_BASE_URL`)* | Опц. отдельный endpoint для worker'а (например, локальный Ollama с 3B-моделью) |
+| `LLM_WORKER_API_KEY` | *(пусто → `LLM_API_KEY`)* | Опц. отдельный API-ключ для worker'а |
 | `MCP_HOST` | `0.0.0.0` | Хост MCP-сервера |
 | `MCP_PORT` | `8765` | Порт |
 | `MAX_ITERATIONS_SPEED/BALANCED/QUALITY` | `2 / 6 / 25` | Лимиты итераций по режимам |
@@ -239,6 +244,198 @@ peer-review, охват и доверие аудитории. Например:
 
 Все домены указаны как **суффиксы** (.com/....org) или TLD-префиксы (.edu),
 поэтому внутренние поддомены (`m.twitter.com`, `cs.mit.edu`, …) тоже матчатся.
+
+### 🧠 LLM-планирование источников (до старта цикла)
+
+Помимо keyword-детектора по тексту, в начале каждого исследования Researcher
+выполняет **один отдельный LLM-вызов** (через planner-модель), который
+классифицирует запрос и выбирает SearXNG-категории:
+
+| Intent | SearXNG categories | Когда выбирается |
+|---|---|---|
+| `social` | `social` | «что обсуждают в твиттере / на реддите / в телеграме» |
+| `academic` | `science` (+ `general` для подстраховки) | «научные статьи / факт-чек / peer-reviewed / arxiv» |
+| `news` | `news` | «последние новости / пресс-релизы» |
+| `videos` | `videos` (+ `general`) | «видео на ютубе / обучающие ролики» |
+| `general` | `general` | обычный web-поиск |
+| `all` | `general + news + science + social + videos` | «ищи всё» |
+
+План стримится в UI как `plan`-событие и сохраняется в `self._source_plan`,
+оттуда попадает в `SearXNGClient.search_many(categories=…)` — поиск сразу
+идёт по правильным категориям (а не только по «general»).
+
+При любой ошибке LLM (нет endpoint'а, битый JSON) — fallback на `SourcePlan.default()`
+с категорией `general`. Пайплайн не падает.
+
+### 🧬 Модельный роутинг: planner (сильная) / worker (слабая)
+
+В Researcher'е используются **две роли LLM** через `LLMFactory`:
+
+| Роль | Что делает | Требования | Пример модели |
+|---|---|---|---|
+| **Planner** | • `_plan_sources()` — выбор источника перед циклом<br>• Главный цикл `research()` — каждый ход (preamble + tools)<br>• `_synthesize()` — финальный ответ | Логика, JSON, следование инструкциям | `qwen2.5:14b/32b`, `llama3.1:70b`, `gpt-4o`, `claude-sonnet` |
+| **Worker** | • `_extract_facts()` — извлечение фактов из скрапленного контента (chunked) | Быстро, дёшево, JSON | `qwen2.5:3b`, `llama3.2:3b`, `phi3:mini`, `gpt-4o-mini` |
+
+Если роли не заданы в `.env` — обе используют базовый `LLM_MODEL`
+(полная обратная совместимость).
+
+Пример конфигурации:
+
+```bash
+# Сильная модель — планирование и синтез
+LLM_PLANNER_MODEL=qwen2.5:14b
+# Слабая модель — извлечение фактов
+LLM_WORKER_MODEL=qwen2.5:3b
+# Опционально: worker на отдельном endpoint
+LLM_WORKER_BASE_URL=http://localhost:11434/v1
+LLM_WORKER_API_KEY=ollama
+```
+
+`LLMFactory` сам решает — открывать два независимых HTTP-клиента
+или переиспользовать один, если конфиги planner и worker совпадают.
+
+### 📜 Полный flow одного исследования (sequence diagram)
+
+Вот что происходит от момента, как ты отправил запрос в Open WebUI,
+до момента, как ты увидел финальный ответ со ссылками:
+
+```
+Пользователь       Open WebUI           MCP-сервер              LLM (planner)       SearXNG          LLM (worker)       Crawl4AI
+     │                  │                     │                       │                 │                  │                │
+     │ "расскажи про    │                     │                       │                 │                  │                │
+     │  квантовые        │                     │                       │                 │                  │                │
+     │  компьютеры 2026" │                     │                       │                 │                  │                │
+     ├─────────────────►│ deep_research(      │                       │                 │                  │                │
+     │                  │   query, mode)      │                       │                 │                  │                │
+     │                  ├────────────────────►│                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ 0. _plan_sources()    │                 │                  │                │
+     │                  │                     ├──────────────────────►│                 │                  │                │
+     │                  │                     │ SOURCE_PLANNER_PROMPT │                 │                  │                │
+     │                  │                     │   + query             │                 │                  │                │
+     │                  │                     │                       │ JSON: intent,   │                  │                │
+     │                  │                     │                       │   categories    │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │ self._source_plan =   │                 │                  │                │
+     │                  │                     │   SourcePlan(...)     │                 │                  │                │
+     │                  │                     │ emit_plan("academic") │                 │                  │                │
+     │                  │◄───── log ──────────│                       │                 │                  │                │
+     │                  │  "plan: academic    │                       │                 │                  │                │
+     │                  │   [science]"        │                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ 1. Главный цикл       │                 │                  │                │
+     │                  │                     │ tools=[preamble,      │                 │                  │                │
+     │                  │                     │         web_search,   │                 │                  │                │
+     │                  │                     │         scrape_url,   │                 │                  │                │
+     │                  │                     │         done]         │                 │                  │                │
+     │                  │                     ├──────────────────────►│                 │                  │                │
+     │                  │                     │ system + history      │                 │                  │                │
+     │                  │                     │                       │ tool_call(      │                  │                │
+     │                  │                     │                       │   preamble)     │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │ emit_plan("Plan:…")   │                 │                  │                │
+     │                  │◄───── log ──────────│                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ tool_call(            │                 │                  │                │
+     │                  │                     │   web_search)         │                 │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │ search_many(          │                 │                  │                │
+     │                  │                     │   queries=[...],      │                 │                  │                │
+     │                  │                     │   categories=["science"]              │                  │                │
+     │                  │                     ├───────────────────────┼────────────────►│                 │                │
+     │                  │                     │                       │                 │ JSON results     │                │
+     │                  │                     │◄──────────────────────┼─────────────────┤                  │                │
+     │                  │                     │ rank_score + should_drop (FilterPolicy) │                  │                │
+     │                  │                     │ emit_search_results   │                 │                  │                │
+     │                  │◄───── log ──────────│                       │                 │                  │                │
+     │                  │  "search_result:    │                       │                 │                  │                │
+     │                  │   5 URLs"           │                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ tool_call(            │                 │                  │                │
+     │                  │                     │   scrape_url)         │                 │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │ crawl_many(urls)      │                 │                  │                │
+     │                  │                     ├───────────────────────┼─────────────────┼──────────────────┼───────────────►│
+     │                  │                     │                       │                 │                  │                │ markdown
+     │                  │                     │◄──────────────────────┼─────────────────┼──────────────────┼────────────────┤
+     │                  │                     │ _extract_facts() ──► WORKER LLM        │                  │                │
+     │                  │                     │                       │                 │   chunked JSON   │                │
+     │                  │                     │                       │                 │◄─────────────────┤                │
+     │                  │                     │ emit_read_done(url, facts)             │                  │                │
+     │                  │◄───── log ──────────│                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ tool_call(done)       │                 │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ 2. _synthesize() ──► PLANNER LLM      │                  │                │
+     │                  │                     │                       │ stream=markdown │                  │                │
+     │                  │                     │◄──────────────────────┤                 │                  │                │
+     │                  │                     │ emit_synthesis_chunk  │                 │                  │                │
+     │                  │◄───── log ──────────│ (стрим чанков ответа) │                 │                  │                │
+     │                  │   "## Квантовые…"   │                       │                 │                  │                │
+     │                  │◄────────────────────│                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │                     │ emit_done(answer,     │                 │                  │                │
+     │                  │                     │          sources)     │                 │                  │                │
+     │                  │◄───── log ──────────│                       │                 │                  │                │
+     │                  │                     │                       │                 │                  │                │
+     │                  │ TextContent(markdown+│                       │                 │                  │                │
+     │                  │   sources)          │                       │                 │                  │                │
+     │                  │◄────────────────────│                       │                 │                  │                │
+     │   видит финал    │                     │                       │                 │                  │                │
+     │◄─────────────────┤                     │                       │                 │                  │                │
+```
+
+### 🔍 Куда какой LLM ходит (всё в одном месте)
+
+| Этап | LLM-роль | Модель (если задана) | Что делает |
+|---|---|---|---|
+| 0. `_plan_sources()` | **Planner** | `LLM_PLANNER_MODEL` | Классифицирует запрос, выбирает SearXNG-категории |
+| 1. Главный цикл `research()` | **Planner** | `LLM_PLANNER_MODEL` | Каждый ход: preamble + выбор tools + JSON-валидация |
+| 2. `scrape_url` → `_extract_facts` | **Worker** | `LLM_WORKER_MODEL` | Извлечение фактов из чанков (механическая работа) |
+| 3. `_synthesize()` | **Planner** | `LLM_PLANNER_MODEL` | Финальный markdown-ответ со ссылками |
+
+Если роли не заданы — **все 4 этапа** идут через `LLM_MODEL` (обратная совместимость).
+
+### 📊 Что увидит пользователь в Open WebUI
+
+После запуска `deep_research` в UI приходит стрим событий (через `ctx.session.send_log_message`):
+
+1. `plan`: *"source plan: academic (science, general) — нужны научные источники"*
+2. `plan`: *"Okay, the user wants to know about quantum computers in 2026…"*
+3. `search_start`: *queries=["quantum computing 2026", "quantum supremacy recent"]*
+4. `search_result`: 5-10 URL с заголовками
+5. `read_start`: *urls=[…]*
+6. `read_done`: *url + первые 500 символов extracted_facts*
+7. `synthesis_chunk`: чанки markdown-ответа (печатаются как пишутся)
+8. `done`: финальный ответ + список источников
+
+Все эти шаги прокидываются через MCP-шину (`EventBus` → `send_log_message`), Open WebUI рисует их как «task steps» в чате.
+
+### 🛡️ Поведение при ошибках
+
+| Сценарий | Что произойдёт |
+|---|---|
+| LLM-планировщик недоступен (endpoint не отвечает) | `_plan_sources()` ловит исключение, `self._source_plan` остаётся дефолтным (`categories=["general"]`). Цикл продолжается как раньше. |
+| LLM вернул битый JSON / текст без JSON | `_parse_source_plan()` возвращает `None` → план остаётся дефолтным. |
+| LLM вернул невалидные категории/intent | Whitelist-фильтр, fallback на `general` + `categories=["general"]`. |
+| Worker-LLM недоступен во время `_extract_facts` | Возвращается исходный chunk текста без извлечения фактов (логируется warning). |
+| Planner и worker идентичны по конфигу | `LLMFactory` создаёт **один** HTTP-клиент и переиспользует для обеих ролей — никакого overhead'а. |
+| `LLM_PLANNER_MODEL` / `LLM_WORKER_MODEL` пустые | Обе роли используют базовый `LLM_MODEL`. Полная обратная совместимость. |
+
+### 🧪 Что покрыто тестами (73 теста, все зелёные)
+
+```
+tests/test_researcher.py       — 1 e2e-тест: цикл plan→search→scrape→done→synthesis
+tests/test_llm_factory.py      — 13 тестов: factory shared/distinct, ENV-overrides,
+                                      SourcePlan parser (strict JSON / markdown fence /
+                                      garbage recovery / invalid categories / intent),
+                                      worker_endpoint
+tests/test_streaming.py        — pub/sub EventBus, close-unblocks-subscribers
+tests/test_filtering.py        — intent detection, FilterPolicy, rank_score, should_drop
+tests/test_searxng_client.py   — SearXNGClient search/search_many с categories
+tests/test_tools.py            — CrawlClient
+```
 
 ## 📁 Структура проекта
 

@@ -31,9 +31,10 @@ from .filter_policy import (
     should_drop,
 )
 from .intent import Intent, IntentMatch, detect_intent
-from .llm_client import LLMClient, LLMResponse, ToolCall
+from .llm_client import LLMClient, LLMFactory, LLMResponse, ToolCall
 from .prompts import (
     EXTRACTOR_PROMPT,
+    SOURCE_PLANNER_PROMPT,
     SYNTHESIS_PROMPT,
     USER_PROMPT_TEMPLATE,
     get_researcher_system_prompt,
@@ -44,8 +45,11 @@ from .types import (
     ResearchInput,
     SearchMode,
     SearchResultItem,
+    SourcePlan,
     tools_for_mode,
 )
+import json as _json
+import re as _re
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +85,11 @@ class Researcher:
         # нашёл — это None (нейтральный режим).
         self._intent_match: IntentMatch | None = self._detect(query)
         self._intent_emitted = False
+        # План источников от LLM — заполняется в research() через
+        # _plan_sources(). По умолчанию — general.
+        self._source_plan: SourcePlan = SourcePlan.default()
+        # Флаг: планирование уже выполнено
+        self._plan_emitted = False
 
     def _detect(self, query: str | None) -> IntentMatch | None:
         if not query:
@@ -111,18 +120,26 @@ class Researcher:
         ]
 
         async with (
-            LLMClient(self.config.llm) as llm,
+            LLMFactory(self.config.llm) as factory,
             SearXNGClient(self.config.searxng) as searxng,
             CrawlClient(self.config.limits) as crawler,
         ):
+            planner = factory.planner()   # сильная модель — планирование и синтез
+            worker = factory.worker()     # слабая модель — извлечение фактов
+
+            # ── 0. Планирование источников (через planner-LLM) ──────
+            # Один вызов LLM ДО старта цикла: выбираем SearXNG-категории
+            # и стратегию реранкинга. При ошибке — fallback на дефолт.
+            await self._plan_sources(input_data.query, planner)
+
             iterations_used = 0
             for i in range(max_iter):
                 iterations_used = i + 1
                 system_prompt = get_researcher_system_prompt(mode, i, max_iter)
                 messages = [{"role": "system", "content": system_prompt}, *history]
 
-                # 1. Запрос к LLM с tools
-                response = await llm.chat(messages, tools=tools, tool_choice="auto")
+                # 1. Запрос к planner-LLM с tools
+                response = await planner.chat(messages, tools=tools, tool_choice="auto")
                 assert isinstance(response, LLMResponse)
                 tool_calls = response.tool_calls
 
@@ -135,19 +152,108 @@ class Researcher:
                     break
 
                 # 3. Выполнение tool calls (параллельно)
-                tool_messages = await self._execute_tools(tool_calls, searxng, crawler, llm)
+                tool_messages = await self._execute_tools(
+                    tool_calls, searxng, crawler, worker
+                )
                 history.extend(tool_messages)
 
                 # 4. Проверяем, вызвал ли LLM `done`
                 if any(tc.name == "done" for tc in tool_calls):
                     break
 
-            # 5. Синтез финального ответа
-            answer = await self._synthesize(llm, input_data.query, history)
+            # 5. Синтез финального ответа — тоже через planner (сильная модель)
+            answer = await self._synthesize(planner, input_data.query, history)
             await self.bus.emit_done(answer, self._all_sources)
 
         return ResearchOutput(
             answer=answer, sources=self._all_sources, iterations=iterations_used
+        )
+
+    # ─────────────────────────────────────────────────────────────────
+    # Планирование источников (вызывается один раз в начале research)
+    # ─────────────────────────────────────────────────────────────────
+    async def _plan_sources(self, query: str, planner: LLMClient) -> None:
+        """Один LLM-вызов: классифицирует запрос и подбирает SearXNG-категории.
+
+        Результат сохраняется в ``self._source_plan`` и используется:
+          • в ``_execute_one('web_search')`` — ``search_many(categories=...)``
+          • в логике адаптивной политики реранкинга — мэппим
+            ``plan.intent`` в один из наших intent-классов для ``make_policy``.
+
+        При любой ошибке (LLM недоступен, битый JSON) — fallback на дефолт
+        ``SourcePlan.default()``, чтобы пайплайн не падал.
+        """
+        if not query:
+            return
+        try:
+            resp = await planner.chat(
+                [
+                    {"role": "system", "content": SOURCE_PLANNER_PROMPT},
+                    {"role": "user", "content": query},
+                ]
+            )
+            if not isinstance(resp, LLMResponse):
+                return
+            plan = self._parse_source_plan(resp.content)
+            if plan is not None:
+                self._source_plan = plan
+                logger.info(
+                    "source plan: intent=%s categories=%s rationale=%s",
+                    plan.intent, plan.searxng_categories, plan.rationale,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_plan_sources failed, using default: %s", exc)
+        finally:
+            # Стримим в UI как plan-событие (один раз)
+            if not self._plan_emitted:
+                await self.bus.emit_plan(
+                    f"source plan: {self._source_plan.intent} "
+                    f"({', '.join(self._source_plan.searxng_categories)})"
+                    + (f" — {self._source_plan.rationale}" if self._source_plan.rationale else "")
+                )
+                self._plan_emitted = True
+
+    @staticmethod
+    def _parse_source_plan(text: str) -> SourcePlan | None:
+        """Грубый парсинг JSON из ответа LLM (даже если в ```json```)."""
+        if not text:
+            return None
+        # Снять markdown-обёртку если есть
+        fenced = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+        candidate = fenced.group(1) if fenced else text.strip()
+        try:
+            obj = _json.loads(candidate)
+        except Exception:  # noqa: BLE001
+            # Попробуем вытащить первый JSON-объект из текста
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            if not m:
+                return None
+            try:
+                obj = _json.loads(m.group(0))
+            except Exception:  # noqa: BLE001
+                return None
+        # Валидация и нормализация
+        intent = str(obj.get("intent", "general")).lower().strip()
+        if intent not in {"social", "academic", "news", "videos", "general", "all"}:
+            intent = "general"
+        cats_raw = obj.get("searxng_categories") or []
+        if not isinstance(cats_raw, list):
+            cats_raw = []
+        allowed_cats = {
+            "general", "news", "science", "social", "videos",
+            "images", "files", "music", "it", "map",
+        }
+        cats = [c for c in (str(x).strip().lower() for x in cats_raw) if c in allowed_cats]
+        if not cats:
+            cats = ["general"]
+        return SourcePlan(
+            intent=intent,
+            searxng_categories=cats,
+            rationale=str(obj.get("rationale", "")).strip()[:300],
+            needs_social=bool(obj.get("needs_social", False)),
+            needs_academic=bool(obj.get("needs_academic", False)),
+            needs_news=bool(obj.get("needs_news", False)),
+            needs_videos=bool(obj.get("needs_videos", False)),
         )
 
     # ─────────────────────────────────────────────────────────────────
@@ -235,19 +341,31 @@ class Researcher:
 
             limits = self.config.limits
             per_query = limits.max_results_per_query
-            results_by_q = await searxng.search_many(queries, max_results_per_query=per_query)
+            # Прокидываем SearXNG-категории из LLM-плана (general/science/
+            # social/news/videos/...). Дефолт из config если план не сделали.
+            searxng_cats = (
+                self._source_plan.searxng_categories
+                or self.config.searxng.categories
+            )
+            results_by_q = await searxng.search_many(
+                queries,
+                max_results_per_query=per_query,
+                categories=searxng_cats,
+            )
 
             # ── Адаптивная политика реранкинга ────────────────────────
-            # На основании распознанного намерения (по тексту запроса)
-            # собираем политику, которая:
-            #  • социальным/научным/новостным режимам — поднимает свои
-            #    домены в топ (но не блокирует остальные);
-            #  • ``all`` — снимает все ограничения и бусты;
-            #  • нейтральному режиму — только ENV-приоритеты и стоп-лист,
-            #    если они заданы (по дефолту всё пусто).
-            intent_name: Intent = (
-                self._intent_match.intent if self._intent_match else "neutral"
-            )
+            # Приоритет источника намерения:
+            #   1) LLM-план (_source_plan.intent) — если задал социальные/
+            #      научные/новостные домены;
+            #   2) keyword-детектор (_intent_match) — fallback;
+            #   3) нейтральный режим — только ENV-приоритеты.
+            plan_intent = self._source_plan.intent
+            if plan_intent in ("social", "academic", "news", "all"):
+                intent_name: Intent = plan_intent  # type: ignore[assignment]
+            elif self._intent_match is not None:
+                intent_name = self._intent_match.intent
+            else:
+                intent_name = "neutral"
             policy = make_policy(
                 intent_name,
                 social=limits.social_domains,

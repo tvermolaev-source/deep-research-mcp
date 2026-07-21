@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from dataclasses import dataclass, field, replace
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 
 from .config import LLMConfig
 
 logger = logging.getLogger(__name__)
+
+
+LLMRole = Literal["planner", "worker"]
 
 
 @dataclass
@@ -194,3 +197,103 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
         resp = await self.chat(messages)
         return resp.content if isinstance(resp, LLMResponse) else ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Модельный роутинг: planner (сильная) / worker (слабая)
+# ─────────────────────────────────────────────────────────────────────
+def _resolve_client_config(cfg: LLMConfig, role: LLMRole) -> LLMConfig:
+    """Возвращает LLMConfig с моделью и endpoint'ом под конкретную роль.
+
+    • ``planner`` — использует ``planner_model`` (если задан), иначе
+      базовый ``model``; ходит на основной endpoint.
+    • ``worker``  — использует ``worker_model`` (если задан), иначе
+      базовый ``model``; может ходить на отдельный endpoint, если
+      заданы ``worker_base_url`` / ``worker_api_key``.
+    """
+    if role == "planner":
+        return replace(cfg, model=cfg.resolved_planner_model())
+    if role == "worker":
+        wmodel = cfg.resolved_worker_model()
+        base, key = cfg.worker_endpoint()
+        return replace(
+            cfg,
+            model=wmodel,
+            base_url=base,
+            api_key=key,
+        )
+    raise ValueError(f"Unknown role: {role}")
+
+
+def make_llm_client(cfg: LLMConfig, role: LLMRole) -> LLMClient:
+    """Фабрика: создаёт :class:`LLMClient` под конкретную роль.
+
+    Возвращает **не открытый** клиент — нужно использовать
+    ``async with`` либо передать в :class:`LLMFactory`.
+    """
+    role_cfg = _resolve_client_config(cfg, role)
+    return LLMClient(role_cfg)
+
+
+class LLMFactory:
+    """Async context manager, отдающий planner/worker-клиентов.
+
+    Используется в Researcher'е вместо одиночного ``LLMClient``:
+
+        async with LLMFactory(self.config.llm) as f:
+            planner = f.planner()   # сильная модель — планирование/синтез
+            worker = f.worker()     # слабая модель — извлечение фактов
+
+    Если planner и worker идентичны (одна модель и один endpoint) —
+    создаётся один общий клиент, чтобы не плодить HTTP-пулы.
+    """
+
+    def __init__(self, cfg: LLMConfig) -> None:
+        self._cfg = cfg
+        self._planner: LLMClient | None = None
+        self._worker: LLMClient | None = None
+        self._shared: bool = False
+        self._opened = False
+
+    async def __aenter__(self) -> "LLMFactory":
+        planner_cfg = _resolve_client_config(self._cfg, "planner")
+        worker_cfg = _resolve_client_config(self._cfg, "worker")
+
+        if (
+            planner_cfg.model == worker_cfg.model
+            and planner_cfg.base_url == worker_cfg.base_url
+            and planner_cfg.api_key == worker_cfg.api_key
+        ):
+            # Один клиент на оба
+            self._planner = LLMClient(planner_cfg)
+            await self._planner.__aenter__()
+            self._worker = self._planner
+            self._shared = True
+        else:
+            self._planner = LLMClient(planner_cfg)
+            self._worker = LLMClient(worker_cfg)
+            await self._planner.__aenter__()
+            await self._worker.__aenter__()
+        self._opened = True
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self._shared:
+            if self._planner is not None:
+                await self._planner.__aexit__(*exc)
+        else:
+            if self._planner is not None:
+                await self._planner.__aexit__(*exc)
+            if self._worker is not None:
+                await self._worker.__aexit__(*exc)
+        self._opened = False
+
+    def planner(self) -> LLMClient:
+        assert self._opened, "LLMFactory must be used as async context manager"
+        assert self._planner is not None
+        return self._planner
+
+    def worker(self) -> LLMClient:
+        assert self._opened, "LLMFactory must be used as async context manager"
+        assert self._worker is not None
+        return self._worker

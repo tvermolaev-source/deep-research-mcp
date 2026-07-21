@@ -99,3 +99,36 @@ Sources:
 
 Now write the final, comprehensive answer in markdown with inline citations.
 """
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Planner prompt — выбор источника и стратегии до старта цикла
+# ─────────────────────────────────────────────────────────────────────
+SOURCE_PLANNER_PROMPT = """You are a research-strategy classifier. You will be given the user's research query.
+
+Your task: decide WHERE to look first, and what the user actually wants.
+
+Output ONLY a strict JSON object (no markdown fences, no commentary):
+
+{{
+  "intent": "social" | "academic" | "news" | "videos" | "general" | "all",
+  "searxng_categories": ["general"|"news"|"science"|"social"|"videos"|"images"|"files"|"music"|"it"|"map"],
+  "rationale": "<one short sentence in the user's language explaining the choice>",
+  "needs_social": true | false,
+  "needs_academic": true | false,
+  "needs_news": true | false,
+  "needs_videos": true | false
+}}
+
+Guidelines for picking `intent` and categories:
+- "social" — пользователь явно хочет обсуждения/мнения людей (Twitter/X, Reddit, VK, Telegram, форумы). Категории SearXNG: ["social"].
+- "academic" — научные статьи, peer-review, препринты, рецензируемые источники, факт-чек. Категории: ["science"]. По желанию добавить "general" для подстраховки.
+- "news" — свежие новости, СМИ, пресс-релизы, репортажи. Категории: ["news"].
+- "videos" — пользователь хочет видео (YouTube, Rutube и т.п.). Категории: ["videos"]. Добавить "general" если тема может быть и в статьях.
+- "general" — обычный web-поиск без явного указания типа. Категории: ["general"].
+- "all" — пользователь явно просит «ищи всё», «без ограничений», «везде». Категории: ["general", "news", "science", "social", "videos"].
+
+Флаги needs_* ставь true, если этот тип источников нужен для ответа, даже если основной intent другой (например, intent="general", но тема подразумевает свежие новости → needs_news=true и стоит добавить "news" в searxng_categories).
+
+Always include "general" if unsure — это безопасный fallback.
+"""

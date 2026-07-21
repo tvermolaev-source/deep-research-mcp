@@ -77,6 +77,36 @@ class ResearchInput:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# SourcePlan — результат LLM-планирования источников (см. _plan_sources)
+# ─────────────────────────────────────────────────────────────────────
+@dataclass
+class SourcePlan:
+    """План источников, построенный planner-LLM до старта цикла.
+
+    • ``intent`` — основной тип источника (``social/academic/news/videos/general/all``)
+    • ``searxng_categories`` — категории, передаваемые в SearXNGClient
+    • ``rationale`` — короткое пояснение (стримится в UI)
+    • ``needs_*`` — флаги, можно использовать в логике (например,
+      увеличить лимит итераций для quality если нужны видео)
+    """
+    intent: str = "general"
+    searxng_categories: list[str] = field(default_factory=lambda: ["general"])
+    rationale: str = ""
+    needs_social: bool = False
+    needs_academic: bool = False
+    needs_news: bool = False
+    needs_videos: bool = False
+
+    @classmethod
+    def default(cls) -> "SourcePlan":
+        return cls(
+            intent="general",
+            searxng_categories=["general"],
+            rationale="default plan",
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Tool-схемы для LLM (OpenAI-compatible function calling)
 # ─────────────────────────────────────────────────────────────────────
 TOOL_PLAN = {
